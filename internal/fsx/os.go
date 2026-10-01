@@ -87,6 +87,9 @@ func (o osFile) Name() string                { return o.f.Name() }
 func (o osFile) Stat() (fs.FileInfo, error)  { return o.f.Stat() }
 func (o osFile) Sync() error                 { return o.f.Sync() }
 func (o osFile) Truncate(size int64) error   { return o.f.Truncate(size) }
+func (o osFile) WriteAt(p []byte, off int64) (int, error) {
+	return o.f.WriteAt(p, off)
+}
 
 var _ File = osFile{}
 

@@ -39,4 +39,33 @@ camelCase/PascalCase/缩写(HTTPRequest→http,request)的切分不改变字节�
 manifest.json 中记录 `state_len`(有效字节前缀)。启动恢复时截断无效尾部。条目为
 JSON Lines(path → size/mtime/sha256/seg/docID 或 tombstone)。
 
+## D8. JSON 文档不附加二进制 footer
+"所有数据文件以 footer 结束"应用于二进制数据文件(terms/terms.idx/postings/norms/dv/
+docs/docs.idx/live_*.bits,共 8 类)。meta.json、manifest.json、state.jsonl 保持纯 JSON
+(可读、可增量追加),完整性分别由:原子 rename 提交(manifest/meta)、manifest 内的
+逐文件 CRC 校验和(段文件)、state_len 有效前缀(state)覆盖。`lantern check` 校验全部。
+
+## D9. 墓碑历史文件(live_<gen>.bits)永久保留
+删除提交写入新代位集后,旧代文件不再删除:文件仅 nDocs/8 字节量级,而 Windows 禁止
+删除仍被句柄打开的文件(会阻塞读者打开期间的恢复与段目录操作)。段目录的完整文件
+清单与校验和记录在 manifest,多余的历史文件不构成不一致。
+
+## D10. FaultFS 截断注入语义 = 撕裂写 + 进程死亡
+真实掉电发生在 manifest 提交点之前(进程死亡)。若截断注入后进程继续运行并提交了
+引用损坏文件的 manifest,重开必然失败,那是注入模型不真实而非协议缺陷。因此
+FaultFS 的 Truncate 注入在截断后令所有后续操作失败(模拟进程死亡),保证:
+提交点之前的撕裂由"旧 manifest + 孤儿清理"吸收。Drop 注入仅对 rename/remove/
+mkdirall/syncdir/syncfile/close 等可幂等跳过的操作开放,其余自动降级为 Fail。
+
+## D11. merge 以"存储文档重放分析"实现
+合并时只读取存活文档的存储字段(path/title/body/ext/size/mtime/sha256)并按路径
+排序后重放 MemTable.Add(重新分析),而非转写倒排。理由:省去跨段 docID 重映射与
+位置搬移逻辑;分析是确定性纯函数,重建结果与原索引逐 token 一致;CPU 可接受。
+合并段的 storeBody = 任一来源段存储正文。
+
+## D12. internal/testutil 的依赖方向
+testutil 供各包 _test.go 导入(生产代码禁止导入),自身可依赖 analysis/query/rank
+以实现随机语料与暴力 oracle。这不违反"包间依赖单向无环":引擎依赖链不变,
+testutil 位于测试侧。
+
 (后续决定按 D 编号追加。)

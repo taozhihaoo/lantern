@@ -21,6 +21,7 @@ type File interface {
 	Stat() (fs.FileInfo, error)
 	Sync() error
 	Truncate(size int64) error
+	WriteAt(p []byte, off int64) (int, error)
 }
 
 // FS 是 Lantern 的文件系统抽象。所有索引 IO 必须经由该接口。

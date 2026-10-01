@@ -251,14 +251,14 @@ func TestSegmentCorruption(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 完整校验先通过。
-	if err := CheckSegment(fsys, dir, "x"); err != nil {
+	if err := CheckSegment(fsys, dir, "x", 0); err != nil {
 		t.Fatalf("clean check failed: %v", err)
 	}
 	// 翻转 terms.dat 中间字节 → CheckSegment 必须报错。
 	data := readTestFile(t, dir+"/terms.dat")
 	data[len(data)/2] ^= 0xFF
 	writeTestFile(t, dir+"/terms.dat", data)
-	if err := CheckSegment(fsys, dir, "x"); err == nil {
+	if err := CheckSegment(fsys, dir, "x", 0); err == nil {
 		t.Fatal("corrupted terms.dat must fail check")
 	}
 	// 截断 postings.dat → 打开段必须报错(尾部 magic 缺失)。

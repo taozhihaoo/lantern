@@ -109,7 +109,7 @@ func TestFaultFSTruncate(t *testing.T) {
 	dir := t.TempDir()
 	ffs := NewFaultFS(OsFS())
 	p := filepath.Join(dir, "seg.bin")
-	// 第 2 次写之后断电截断到 5 字节;后续写被丢弃但报成功。
+	// 第 2 次写之后断电截断到 5 字节;断电后一切操作必须失败。
 	ffs.Inject(Fault{Op: "write", Path: "seg.bin", After: 2, Mode: ModeTruncate, TruncSize: 5})
 	f, err := ffs.Create(p)
 	if err != nil {
@@ -122,11 +122,8 @@ func TestFaultFSTruncate(t *testing.T) {
 	if _, err := f.Write(bytes.Repeat([]byte("b"), 8)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.Write(bytes.Repeat([]byte("c"), 8)); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Sync(); err != nil {
-		t.Fatal(err)
+	if _, err := f.Write(bytes.Repeat([]byte("c"), 8)); err == nil {
+		t.Fatal("writes after power loss must fail")
 	}
 	st, err := f.Stat()
 	if err != nil {

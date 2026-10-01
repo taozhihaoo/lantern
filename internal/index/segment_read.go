@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"lantern/internal/codec"
 	"lantern/internal/fsx"
@@ -57,12 +58,13 @@ type SegmentReader struct {
 	fields   [NumFields]FieldStat
 	extDict  []string
 	termsIdx []termIdxEntry
+	storeAll bool
 
-	mu        sync.Mutex
+	mu        sync.Mutex // 保护 skipCache
 	skipCache map[segTermKey][]skipEntry
 
-	live    *codec.Bitset
-	liveGen uint32
+	livePtr atomic.Pointer[codec.Bitset] // 当前墓碑位集
+	liveGen atomic.Uint32
 }
 
 // OpenSegment 打开段目录并对每个文件做 footer 尾部的快速校验
@@ -119,6 +121,7 @@ func OpenSegment(fsys fsx.FS, dir, id string, cache *BlockCache) (*SegmentReader
 	}
 	r.nDocs = meta.Docs
 	r.extDict = meta.ExtDict
+	r.storeAll = meta.StoreAll
 	for f := Field(0); f < NumFields; f++ {
 		fm, ok := meta.Fields[f.Name()]
 		if !ok {
@@ -148,8 +151,8 @@ func OpenSegment(fsys fsx.FS, dir, id string, cache *BlockCache) (*SegmentReader
 	if uint32(live.Len()) != r.nDocs && live.Len() > 0 {
 		return fail(fmt.Errorf("index: live bits len %d != docs %d in %s", live.Len(), r.nDocs, id))
 	}
-	r.live = live
-	r.liveGen = 0
+	r.livePtr.Store(live)
+	r.liveGen.Store(0)
 	return r, nil
 }
 
@@ -260,15 +263,43 @@ func (r *SegmentReader) DocCount() uint32 { return r.nDocs }
 func (r *SegmentReader) FieldStats() [NumFields]FieldStat { return r.fields }
 
 // IsAlive 报告 docID 是否存活(未被墓碑删除)。
-func (r *SegmentReader) IsAlive(docID uint32) bool { return !r.live.Get(docID) }
+func (r *SegmentReader) IsAlive(docID uint32) bool {
+	return !r.livePtr.Load().Get(docID)
+}
+
+// currentLive 返回当前墓碑位集(只读)。
+func (r *SegmentReader) currentLive() *codec.Bitset { return r.livePtr.Load() }
+
+// CloneLive 返回当前墓碑位集的副本(供删除提交构造下一代)。
+func (r *SegmentReader) CloneLive() *codec.Bitset {
+	cur := r.currentLive()
+	out := codec.NewBitset(int(cur.Len()))
+	cur.Iterate(func(i uint32) bool {
+		out.Set(i)
+		return true
+	})
+	return out
+}
+
+// CloneLiveWith 返回当前墓碑位集加上 docs 的副本。
+func (r *SegmentReader) CloneLiveWith(docs []uint32) *codec.Bitset {
+	out := r.CloneLive()
+	for _, d := range docs {
+		out.Set(d)
+	}
+	return out
+}
+
+// StoreAll 报告本段建立时是否存储正文。
+func (r *SegmentReader) StoreAll() bool { return r.storeAll }
 
 // LiveGen 返回当前墓碑代。
-func (r *SegmentReader) LiveGen() uint32 { return r.liveGen }
+func (r *SegmentReader) LiveGen() uint32 { return r.liveGen.Load() }
 
-// SetLive 更新墓碑位集与代号(仅由提交/合并路径调用)。
+// SetLive 原子更新墓碑位集与代号(仅由提交/合并路径调用)。
 func (r *SegmentReader) SetLive(gen uint32, bits *codec.Bitset) {
-	r.live = bits
-	r.liveGen = gen
+	r.livePtr.Store(bits)
+	r.liveGen.Store(gen)
 }
 
 // termsEntryFull 是解码出的完整词典条目。
@@ -750,29 +781,62 @@ func decodeStoredDoc(rec []byte) (*StoredDoc, error) {
 	return sd, nil
 }
 
-// CheckSegment 完整校验段内所有带 footer 文件的 CRC 与 meta 一致性。
-func CheckSegment(fsys fsx.FS, dir, id string) error {
-	for _, name := range segmentFiles() {
-		data, err := readWholeFile(fsys, filepath.Join(dir, name))
+// CheckSegment 完整校验段内所有文件:二进制文件的 magic/version/CRC、
+// meta.json 可解析、liveName(liveGen) 存在且长度与文档数一致。
+func CheckSegment(fsys fsx.FS, dir, id string, liveGen uint32) error {
+	ents, err := fsys.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("index: check %s: %w", id, err)
+	}
+	if len(ents) == 0 {
+		return fmt.Errorf("index: check %s: empty segment dir", id)
+	}
+	var meta *metaJSON
+	for _, e := range ents {
+		name := e.Name()
+		full := filepath.Join(dir, name)
+		if name == fMeta {
+			mb, err := readWholeFile(fsys, full)
+			if err != nil {
+				return fmt.Errorf("index: check %s/meta.json: %w", id, err)
+			}
+			var m metaJSON
+			if err := json.Unmarshal(mb, &m); err != nil {
+				return fmt.Errorf("index: check %s/meta.json: %w", id, err)
+			}
+			if m.Format != FormatVersion {
+				return fmt.Errorf("index: check %s: format %d != %d", id, m.Format, FormatVersion)
+			}
+			meta = &m
+			continue
+		}
+		data, err := readWholeFile(fsys, full)
 		if err != nil {
 			return fmt.Errorf("index: check %s/%s: %w", id, name, err)
 		}
-		if _, ver, err := codec.ParseFooter(data); err != nil {
+		payload, ver, err := codec.ParseFooter(data)
+		if err != nil {
 			return fmt.Errorf("index: check %s/%s: %w", id, name, err)
-		} else if ver != FormatVersion {
+		}
+		if ver != FormatVersion {
 			return fmt.Errorf("index: check %s/%s: format %d", id, name, ver)
 		}
+		if name == liveName(liveGen) {
+			bits, err := codec.DecodeBitset(payload)
+			if err != nil {
+				return fmt.Errorf("index: check %s/%s: %w", id, name, err)
+			}
+			if meta != nil && bits.Len() > 0 && uint32(bits.Len()) != meta.Docs {
+				return fmt.Errorf("index: check %s/%s: bitset len %d != docs %d",
+					id, name, bits.Len(), meta.Docs)
+			}
+		}
 	}
-	mb, err := readWholeFile(fsys, filepath.Join(dir, fMeta))
-	if err != nil {
-		return fmt.Errorf("index: check %s/meta.json: %w", id, err)
+	if meta == nil {
+		return fmt.Errorf("index: check %s: missing meta.json", id)
 	}
-	var meta metaJSON
-	if err := json.Unmarshal(mb, &meta); err != nil {
-		return fmt.Errorf("index: check %s/meta.json: %w", id, err)
-	}
-	if meta.Format != FormatVersion {
-		return fmt.Errorf("index: check %s: format %d != %d", id, meta.Format, FormatVersion)
+	if _, err := fsys.Stat(filepath.Join(dir, liveName(liveGen))); err != nil {
+		return fmt.Errorf("index: check %s: missing %s: %w", id, liveName(liveGen), err)
 	}
 	return nil
 }

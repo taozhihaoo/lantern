@@ -36,14 +36,17 @@ type Fault struct {
 }
 
 // FaultFS 在任意 base FS 之上注入故障,用于崩溃安全测试。
+// Truncate 注入模拟断电撕裂:截断发生后进程视为死亡,FaultFS 的所有
+// 后续操作立即失败(ErrInjected),提交协议因此无法越过提交点。
 // FaultFS 并发安全。
 type FaultFS struct {
 	base FS
 
-	mu       sync.Mutex
-	faults   []*faultRule
-	opsCount map[string]int
-	frozen   map[*faultFile]bool
+	mu        sync.Mutex
+	faults    []*faultRule
+	opsCount  map[string]int
+	frozen    map[*faultFile]bool
+	powerLost bool
 }
 
 type faultRule struct {
@@ -60,14 +63,27 @@ func NewFaultFS(base FS) *FaultFS {
 	}
 }
 
-// Inject 追加一条故障规则。
+// Inject 追加一条故障规则。Op 为 "*" 时匹配全部操作;
+// 对不支持静默跳过的操作(create/open/openfile/write/stat/readdir),
+// Drop 模式自动降级为 Fail(跳过它们会破坏句柄语义)。
 func (f *FaultFS) Inject(ft Fault) {
 	if ft.Times < 1 {
 		ft.Times = 1
 	}
+	if ft.Mode == ModeDrop && !dropable(ft.Op) {
+		ft.Mode = ModeFail
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.faults = append(f.faults, &faultRule{Fault: ft})
+}
+
+func dropable(op string) bool {
+	switch op {
+	case "rename", "remove", "removeall", "mkdirall", "syncdir", "syncfile", "close":
+		return true
+	}
+	return false
 }
 
 // Ops 返回某类操作(含被 Drop 的)累计发生次数。
@@ -90,8 +106,11 @@ func (f *FaultFS) injected(op, name string) (*faultRule, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.opsCount[op]++
+	if f.powerLost {
+		return &faultRule{Fault: Fault{Mode: ModeFail}}, true
+	}
 	for _, r := range f.faults {
-		if r.Op != op {
+		if r.Op != "*" && r.Op != op {
 			continue
 		}
 		if !matchFaultPath(r.Path, name) {
@@ -112,6 +131,12 @@ func (f *FaultFS) isFrozen(w *faultFile) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.frozen[w]
+}
+
+func (f *FaultFS) isPowerLost() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.powerLost
 }
 
 func (f *FaultFS) freeze(w *faultFile) {
@@ -274,8 +299,8 @@ func (w *faultFile) Write(p []byte) (int, error) {
 		return 0, fmt.Errorf("%w: write %s", ErrInjected, name)
 	}
 	if w.fs.isFrozen(w) {
-		// 断电后句柄上的后续写全部丢弃,但报告成功。
-		return len(p), nil
+		// 断电后进程已死亡:一切操作失败。
+		return 0, fmt.Errorf("%w: power lost after truncate on %s", ErrInjected, name)
 	}
 	n, err := w.File.Write(p)
 	if err != nil {
@@ -283,7 +308,10 @@ func (w *faultFile) Write(p []byte) (int, error) {
 	}
 	if ok && r.Mode == ModeTruncate {
 		if terr := w.File.Truncate(r.TruncSize); terr == nil {
-			w.fs.freeze(w)
+			w.fs.mu.Lock()
+			w.fs.frozen[w] = true
+			w.fs.powerLost = true
+			w.fs.mu.Unlock()
 		}
 	}
 	return n, nil
@@ -304,6 +332,13 @@ func (w *faultFile) Sync() error {
 }
 
 func (w *faultFile) Close() error {
+	if w.fs.isPowerLost() {
+		// 断电后进程死亡:操作系统关闭全部句柄,Close 必须真实释放,
+		// 否则测试环境的文件删除会被阻塞。
+		err := w.File.Close()
+		w.fs.thaw(w)
+		return err
+	}
 	name := w.File.Name()
 	r, ok := w.fs.injected("close", name)
 	if ok {
