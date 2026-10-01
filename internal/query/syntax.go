@@ -44,8 +44,9 @@ type token struct {
 	field    string // "" 或 title/path/body/ext/size/mtime
 	isPrefix bool
 	fuzzy    int  // -1 = 无;0..2 = 编辑距离
-	slop     int  // phrase 的 ~N;0 = 严格短语
 	hasFuzzy bool // 区分 foo~(自动)与无修饰
+	slop     int  // phrase 的 ~N;0 = 严格短语
+	slopSet  bool // 是否显式写了 ~
 	raw      string
 	col      int // rune 列(1-based)
 }
@@ -120,7 +121,7 @@ func isTermChar(r rune) bool {
 		return true
 	}
 	switch r {
-	case '_', '-', '.', '#', '@', '/', '\\':
+	case '_', '-', '.', '#', '@', '/', '\\', '*', '~':
 		return true
 	}
 	return false
@@ -166,19 +167,20 @@ func (lx *Lexer) Lex() ([]token, error) {
 			if isFieldIdent(r) {
 				// 大写操作符。
 				if w, n := lx.matchWord(); n > 0 {
+					opCol := lx.col()
 					if w == "AND" {
 						lx.pos += n
-						out = append(out, token{kind: tokAnd, col: lx.col()})
+						out = append(out, token{kind: tokAnd, col: opCol})
 						continue
 					}
 					if w == "OR" {
 						lx.pos += n
-						out = append(out, token{kind: tokOr, col: lx.col()})
+						out = append(out, token{kind: tokOr, col: opCol})
 						continue
 					}
 					if w == "NOT" {
 						lx.pos += n
-						out = append(out, token{kind: tokNot, col: lx.col()})
+						out = append(out, token{kind: tokNot, col: opCol})
 						continue
 					}
 				}
@@ -324,6 +326,7 @@ func (lx *Lexer) lexPhrase() (token, error) {
 	// slop。
 	if r, ok := lx.cur(); ok && r == '~' {
 		lx.pos++
+		tok.slopSet = true
 		start := lx.pos
 		for {
 			r2, ok2 := lx.cur()

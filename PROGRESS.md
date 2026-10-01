@@ -72,6 +72,38 @@
 修复记录:commit 漏 unlock 导致死锁;refs++ 读锁下竞争(改原子量);
 内存状态表未应用自动 put 条目导致 compact 后路径丢失;均被测试捕获。
 
+## M5 查询 — ✅ 完成
+
+- [x] lexer/parser/AST:NOT>AND>OR、隐式 AND、括号、短语 "…"、~slop 邻近、
+      字段限定(title/path/body/ext/size/mtime)、前缀 *、模糊 ~/~/N
+- [x] 语法错误带列号与 ^ 指示符(query:1:C: 三行格式,操作符列号取起始)
+- [x] planner + 迭代器树:AND leapfrog、OR 归并、短语/邻近位置交集、NOT 排除、
+      过滤惰性求值(doc values)、Top-K 小根堆(同分按路径字典序)
+- [x] 匹配与打分分离:迭代器树负责匹配;得分由 plan 树递归求值
+      (只有命中分支贡献分数,与暴力 oracle 语义一致)
+- [x] CJK 查询:单字 → 二元组包含展开;多字 → bigram 序列短语;
+      混排(Go语言并发)→ 拉丁词 + CJK 短语 AND
+- [x] 模糊展开:有序词典 + 共享 DP 行前缀剪枝(行最小值>k 整树剪枝);
+      展开权重 = 1 - dist/len(下限 0.05);上限 1024 超限标记 truncated
+- [x] 前缀展开(同一上限);单字 CJK 展开(包含匹配,见 D5)
+- [x] 差分测试(规格 11.2):testutil 固定种子语料(齐夫词表+中文+标识符)
+      + 独立暴力 oracle;5 种子 × 3 分段配置(单段/多段/合并后)× 40 随机查询,
+      结果集与 Total 完全一致;Top-K 分数误差 < 1e-9(TestDifferentialScoring)
+- [x] 标准用例:搜索/引擎/擎 命中"全文搜索引擎";Go语言并发 混排命中;
+      "http request" 短语命中 parseHTTPRequest;snake 子词单独检索(TestCriteria)
+- [x] FuzzLexer:任意输入不 panic,错误类型必须为 SyntaxError
+
+实测:`go test -race ./...` 全部通过;FuzzLexer 15s 无 crash。
+修复记录(全部由差分测试暴露):
+1. termIter 误把字段间 OR 写成 AND(仅 56/150 文档命中);
+2. 迭代器构造时预定位导致每段首文档被跳过(统一惰性初始化约定);
+3. 得分逐字段饱和(BM25F 应先跨字段求和 tfw 再一次饱和);
+4. OR 查询得分语义(非命中分支不得贡献分数)→ 递归求值重构;
+5. decodeStoredDoc 用压缩长度当解压长度截断了存储正文;
+6. 多段查询 CJK 部分经 raw 重分析引入错误 bigram(改用 part.terms);
+7. 操作符列号记在推进之后;
+8. 查询生成器按字节切 CJK 前缀产生非法 UTF-8(改 rune 切)。
+
 ## 第 14 节完成标准自检
 
 (全部里程碑完成后逐项填写实际命令输出摘要。)

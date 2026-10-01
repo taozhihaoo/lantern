@@ -768,15 +768,17 @@ func decodeStoredDoc(rec []byte) (*StoredDoc, error) {
 	}
 	pos += sz
 	if flags&1 != 0 {
-		body := make([]byte, blen)
+		// 解压长度与压缩长度不同:以存储上限为界读取,超限视为损坏。
 		fr := flate.NewReader(bytes.NewReader(rec[pos : pos+int(blen)]))
-		n, err := io.ReadFull(fr, body)
-		if err != nil && err != io.ErrUnexpectedEOF {
-			fr.Close()
+		defer fr.Close()
+		body, err := io.ReadAll(io.LimitReader(fr, int64(DefaultBodyLimit)+1))
+		if err != nil {
 			return nil, fmt.Errorf("index: stored doc body inflate: %w", err)
 		}
-		fr.Close()
-		sd.Body = string(body[:n])
+		if len(body) > DefaultBodyLimit {
+			return nil, fmt.Errorf("index: stored doc body exceeds limit")
+		}
+		sd.Body = string(body)
 	}
 	return sd, nil
 }
