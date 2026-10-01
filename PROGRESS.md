@@ -25,6 +25,18 @@
 实测:`go test -cover ./internal/analysis` → **100.0%** statements。
 已知问题:无效 UTF-8 输入下"rune 对齐"无定义,fuzz 不变量仅在合法 UTF-8 输入上检查对齐。
 
+## M2 codec — ✅ 完成
+
+- [x] varint(u32/u64)、delta 编解码
+- [x] 位集 Set/Get/Rank1/Iterate + 序列化
+- [x] 前缀压缩字符串块(terms.dat 每 64 词项一块)
+- [x] CRC32 footer 封装:magic "LNTN" + version(u32 LE) + crc(u32 LE),
+      CRC 覆盖 payload+magic+version
+- [x] 往返测试、截断/翻转损坏检测测试 + FuzzCodecRoundtrip(20s ≈ 60 万次执行)
+
+实测:`go test -cover ./internal/codec` → **91.2%** statements。
+修复记录:初版 ParseFooter 的 CRC 覆盖范围与写入端不一致,测试立即暴露并修复。
+
 ## 第 14 节完成标准自检
 
 (全部里程碑完成后逐项填写实际命令输出摘要。)
