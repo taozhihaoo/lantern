@@ -416,3 +416,6 @@ func (s *Searcher) boostOf(r *index.SegmentReader, doc uint32) float64 {
 	}
 	return 1
 }
+
+// Stats 返回搜索器的全局统计(诊断用)。
+func (s *Searcher) Stats() rank.Stats { return s.stats }

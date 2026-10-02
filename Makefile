@@ -19,13 +19,16 @@ fuzz-short:
 	$(GO) test -fuzz=FuzzLexer -fuzztime=20s ./internal/query
 
 bench:
-	$(GO) test -bench=. -benchmem -run=NONE -benchtime=1x ./...
+	$(GO) test -bench=. -benchmem -run=NONE -benchtime=1x ./internal/index ./internal/query
 
 demo: build
 	bash scripts/demo.sh
 
-check: build
-	./bin/lantern check || true
+corpus:
+	$(GO) run ./scripts/gen_corpus -dir corpus -n 100000 -target-mb 500
+
+bench-latency: build
+	$(GO) run ./scripts/bench_search -index .lantern -mode and
 
 fmt:
 	gofmt -l .

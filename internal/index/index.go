@@ -511,3 +511,26 @@ func (ix *Index) Root() string { return ix.root }
 
 // SetFS 替换底层文件系统(仅测试使用:在打开后切换为故障注入 FS)。
 func (ix *Index) SetFS(f fsx.FS) { ix.fsys = f }
+
+// StatePaths 返回状态表中全部存活路径(排序)。
+func (ix *Index) StatePaths() []string {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	return ix.state.paths()
+}
+
+// StateInfo 是路径状态的可读摘要(SHA 为十六进制)。
+type StateInfo struct {
+	Size  int64
+	MTime int64
+	SHA   string
+}
+
+// StateInfoOf 返回路径的状态摘要(增量扫描对比用)。
+func (ix *Index) StateInfoOf(path string) (StateInfo, bool) {
+	e, _, ok := ix.Lookup(path)
+	if !ok {
+		return StateInfo{}, false
+	}
+	return StateInfo{Size: e.Size, MTime: e.MTime, SHA: e.SHA}, true
+}

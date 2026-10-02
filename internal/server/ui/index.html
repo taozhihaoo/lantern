@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lantern 全文搜索</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #6b7280; --card: #f6f7f9;
+    --accent: #2563eb; --bar: #2563eb; --border: #e5e7eb; --mark: #fde68a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111318; --fg: #e5e7eb; --muted: #9ca3af; --card: #1a1d24;
+      --accent: #60a5fa; --bar: #60a5fa; --border: #2a2e37; --mark: #7a5b00;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.6 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  #q {
+    width: 100%; padding: 10px 14px; font-size: 16px; color: var(--fg);
+    background: var(--card); border: 1px solid var(--border); border-radius: 8px; outline: none;
+  }
+  #q:focus { border-color: var(--accent); }
+  .meta { color: var(--muted); font-size: 12px; margin: 10px 2px; min-height: 18px; }
+  .hit {
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 14px; margin: 8px 0; cursor: pointer; background: var(--card);
+  }
+  .hit.sel { border-color: var(--accent); }
+  .hit .path { font-weight: 600; }
+  .hit .score { color: var(--muted); font-size: 12px; float: right; }
+  .hit .title { font-size: 13px; color: var(--muted); }
+  .hit .snippet { font-size: 13px; margin-top: 6px; color: var(--fg); }
+  mark { background: var(--mark); color: var(--fg); border-radius: 2px; padding: 0 1px; }
+  .detail { display: none; margin-top: 10px; border-top: 1px dashed var(--border); padding-top: 8px; }
+  .hit.open .detail { display: block; }
+  .barrow { display: flex; align-items: center; gap: 8px; margin: 3px 0; font-size: 12px; }
+  .barname { width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bartrack { flex: 1; background: var(--border); border-radius: 3px; height: 8px; }
+  .barfill { height: 8px; border-radius: 3px; background: var(--bar); }
+  .barval { width: 90px; text-align: right; color: var(--muted); }
+  .wn { margin-top: 28px; border-top: 1px solid var(--border); padding-top: 14px; }
+  .wn h2 { font-size: 15px; margin: 0 0 8px; }
+  .wn input {
+    width: 100%; padding: 8px 12px; color: var(--fg); background: var(--card);
+    border: 1px solid var(--border); border-radius: 6px; font-size: 14px;
+  }
+  #wnout { font-size: 13px; white-space: pre-wrap; margin-top: 10px; color: var(--fg); }
+  .err { color: #ef4444; }
+  kbd { border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; font-size: 11px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Lantern 全文搜索</h1>
+  <div class="sub">Explain 每条得分可展开逐项拆解;键盘 <kbd>↑</kbd><kbd>↓</kbd> 选择,<kbd>Enter</kbd>/<kbd>Esc</kbd> 展开收起;界面完全离线,无任何外部请求。</div>
+  <input id="q" type="text" placeholder='搜索…(支持 AND/OR/NOT、"短语"~n、字段:、前缀*、模糊~)' autofocus>
+  <div class="meta" id="meta"></div>
+  <div id="hits"></div>
+
+  <div class="wn">
+    <h2>为什么没搜到?</h2>
+    <input id="wnpath" type="text" placeholder="输入文档路径,如 docs/a.md(查询使用上方输入框)">
+    <div id="wnout"></div>
+  </div>
+</div>
+<script>
+(function () {
+  "use strict";
+  var qEl = document.getElementById("q");
+  var metaEl = document.getElementById("meta");
+  var hitsEl = document.getElementById("hits");
+  var wnEl = document.getElementById("wnpath");
+  var wnOut = document.getElementById("wnout");
+  var timer = null, lastQ = "", sel = -1;
+
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+  function hl(text, marks) {
+    var out = "", last = 0, t = String(text || "");
+    (marks || []).forEach(function (m) {
+      if (m.start < last || m.end > t.length) return;
+      out += esc(t.slice(last, m.start)) + "<mark>" + esc(t.slice(m.start, m.end)) + "</mark>";
+      last = m.end;
+    });
+    out += esc(t.slice(last));
+    return out;
+  }
+
+  function search(q) {
+    if (!q) { metaEl.textContent = ""; hitsEl.innerHTML = ""; return; }
+    fetch("/api/search?q=" + encodeURIComponent(q) + "&n=20&explain=1")
+      .then(function (r) { return r.json().then(function (j) { return { code: r.status, j: j }; }); })
+      .then(function (res) {
+        if (res.code !== 200) {
+          metaEl.innerHTML = '<span class="err">' + esc(res.j.error || "查询错误") + "</span>";
+          return;
+        }
+        var j = res.j;
+        metaEl.textContent = "共 " + j.total + " 条命中" + (j.truncated ? "(展开超限,已截断)" : "");
+        hitsEl.innerHTML = "";
+        j.hits.forEach(function (h, i) {
+          var d = document.createElement("div");
+          d.className = "hit";
+          d.dataset.i = i;
+          var bars = "";
+          if (h.explain) {
+            var maxc = 0;
+            h.explain.terms.forEach(function (t) { if (t.contribution > maxc) maxc = t.contribution; });
+            h.explain.terms.forEach(function (t) {
+              var pct = maxc > 0 ? (t.contribution / maxc * 100) : 0;
+              bars += '<div class="barrow"><div class="barname" title="' + esc(t.text) + '">' +
+                esc(t.text) + " ×" + t.weight.toFixed(2) + "</div>" +
+                '<div class="bartrack"><div class="barfill" style="width:' + pct.toFixed(1) + '%"></div></div>' +
+                '<div class="barval">' + t.contribution.toFixed(6) + "</div></div>";
+            });
+            bars += '<div class="barrow"><div class="barname">N=' + h.explain.n +
+              " boost=" + h.explain.boost.toFixed(3) + '</div><div class="bartrack"></div>' +
+              '<div class="barval">Σ=' + h.explain.final_score.toFixed(6) + "</div></div>";
+          }
+          d.innerHTML =
+            '<span class="score">' + h.score.toFixed(4) + "</span>" +
+            '<div class="path">' + esc(h.path) + "</div>" +
+            (h.title ? '<div class="title">' + esc(h.title) + "</div>" : "") +
+            (h.snippet ? '<div class="snippet">' + hl(h.snippet, h.highlights) + "</div>" : "") +
+            '<div class="detail">' + bars + "</div>";
+          d.addEventListener("click", function () { d.classList.toggle("open"); });
+          hitsEl.appendChild(d);
+        });
+        sel = -1;
+      })
+      .catch(function (e) { metaEl.innerHTML = '<span class="err">请求失败</span>'; });
+  }
+
+  qEl.addEventListener("input", function () {
+    clearTimeout(timer);
+    timer = setTimeout(function () { search(qEl.value.trim()); }, 120);
+  });
+  qEl.addEventListener("keydown", function (e) {
+    var items = hitsEl.querySelectorAll(".hit");
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      if (!items.length) return;
+      if (sel >= 0) items[sel].classList.remove("sel");
+      sel = e.key === "ArrowDown" ? Math.min(sel + 1, items.length - 1) : Math.max(sel - 1, 0);
+      items[sel].classList.add("sel");
+      items[sel].scrollIntoView({ block: "nearest" });
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (sel >= 0 && items[sel]) items[sel].classList.toggle("open");
+      else search(qEl.value.trim());
+    } else if (e.key === "Escape" && sel >= 0 && items[sel]) {
+      items[sel].classList.remove("open");
+    }
+  });
+
+  var wnTimer = null;
+  function whyNot() {
+    var q = qEl.value.trim(), p = wnEl.value.trim();
+    if (!q || !p) { wnOut.textContent = ""; return; }
+    fetch("/api/why-not?q=" + encodeURIComponent(q) + "&path=" + encodeURIComponent(p))
+      .then(function (r) { return r.json().then(function (j) { return { code: r.status, j: j }; }); })
+      .then(function (res) {
+        if (res.code !== 200) { wnOut.innerHTML = '<span class="err">' + esc(res.j.error) + "</span>"; return; }
+        var j = res.j, lines = [];
+        if (j.match) { lines.push("该文档命中查询。"); }
+        if (j.document && j.document.reason) {
+          lines.push("文档层: " + j.document.reason + " — " + (j.document.detail || ""));
+          if (j.document.rule) lines.push("  规则: " + j.document.rule.pattern + " (" + j.document.rule.source + ":" + j.document.rule.line + ")");
+        }
+        (j.clauses || []).forEach(function (c) {
+          lines.push("子句层: [" + c.status + "] " + c.clause + " — " + (c.detail || ""));
+          (c.positions || []).forEach(function (p) { lines.push("  位置: " + p.term + "@" + p.field + " = " + JSON.stringify(p.pos)); });
+          (c.nearest || []).forEach(function (n) { lines.push("  最近词: " + n.term + " (距离 " + n.dist + ", " + n.field + "@" + n.pos + ")"); });
+          if (c.actual || c.required) lines.push("  实际: " + (c.actual || "-") + " / 要求: " + (c.required || "-"));
+        });
+        (j.suggestions || []).forEach(function (s) {
+          if (s.estimated_rank > 0) lines.push("建议: 移除 “" + s.remove_clause + "” 后可命中,新查询 “" + s.new_query + "”,估计排名 " + s.estimated_rank + "/" + s.total);
+        });
+        wnOut.textContent = lines.join("\n") || "(无诊断信息)";
+      });
+  }
+  wnEl.addEventListener("input", function () {
+    clearTimeout(wnTimer);
+    wnTimer = setTimeout(whyNot, 250);
+  });
+})();
+</script>
+</body>
+</html>
