@@ -1,0 +1,6 @@
+why-not: query="\"notes release\"" path=normal.md
+子句层:
+  [phrase_fail] "notes release" — 短语未按顺序相邻出现;检测到词项顺序颠倒
+    位置: notes@body = [1]
+    位置: release@body = [0]
+    实际: 实际最小间隔 1 / 要求: 要求最小间隔 1

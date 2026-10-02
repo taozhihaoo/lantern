@@ -1,0 +1,4 @@
+why-not: query="releasx" path=normal.md
+子句层:
+  [missing] releasx — 词项 "releasx" 缺失;文档中最近的词:release(距离1,body@0)
+    最近词: release (距离 1, body@0)

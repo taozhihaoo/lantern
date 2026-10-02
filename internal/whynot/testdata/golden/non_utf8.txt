@@ -1,0 +1,3 @@
+why-not: query="搜索" path=gbk.txt
+文档层: 该文档不在索引中
+  原因: non_utf8 — 非 UTF-8 编码(如 GBK),不支持解码

@@ -1,0 +1,6 @@
+why-not: query="\"release alpha\"" path=normal.md
+子句层:
+  [phrase_fail] "release alpha" — 短语未按顺序相邻出现;顺序正确但间隔过大
+    位置: release@body = [0]
+    位置: alpha@body = [10]
+    实际: 实际最小间隔 10 / 要求: 要求最小间隔 1

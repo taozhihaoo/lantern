@@ -1,0 +1,4 @@
+why-not: query="搜索" path=skip.log
+文档层: 该文档不在索引中
+  原因: ignored — 被规则 "*.log" 命中(来源 .gitignore:1)
+  规则: *.log (.gitignore:1)

@@ -1,0 +1,3 @@
+why-not: query="搜索" path=../outside.md
+文档层: 该文档不在索引中
+  原因: outside — 路径不在索引根目录之下

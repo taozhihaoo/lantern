@@ -1,0 +1,6 @@
+why-not: query="-release alpha" path=normal.md
+子句层:
+  [not_triggered] release — NOT 子句命中该文档,导致整体被排除
+    位置: release@body = [0]
+建议层:
+  移除子句 "-(release)" 后可命中:新查询 "alpha",估计排名 1/1

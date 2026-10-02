@@ -1,0 +1,3 @@
+why-not: query="搜索" path=notindexed.md
+文档层: 该文档不在索引中
+  原因: not_scanned — 文件存在且可读,但尚未被索引(不在索引运行覆盖范围内或上次索引后未重新扫描)

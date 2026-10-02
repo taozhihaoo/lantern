@@ -1,0 +1,4 @@
+why-not: query="title:release" path=normal.md
+子句层:
+  [field_mismatch] release — 词项 "release" 只出现在未被检索的字段 body
+    位置: release@body = [0]

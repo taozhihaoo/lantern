@@ -1,0 +1,5 @@
+why-not: query="release missingword" path=normal.md
+子句层:
+  [missing] missingword — 词项 "missingword" 不在该文档检索范围内
+建议层:
+  移除子句 "missingword" 后可命中:新查询 "release",估计排名 1/1

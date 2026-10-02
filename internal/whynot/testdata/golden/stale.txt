@@ -1,0 +1,5 @@
+why-not: query="CHANGED" path=late.md
+文档层: 索引已过期
+  磁盘文件与索引记录不一致,索引已过期;建议重新执行 lantern index
+  索引记录: size=22 mtime=1700000000 sha=9fbcbeedcf80070a069d1e336548b78ec193d9e5bbab51d1cbff074edc0cd8b7
+  磁盘现状: size=36 mtime=1700000000 sha=7ec4e81d4a6ed41af8663e32c42d5794c8fcd23942d169b3bd1305190128e6c6

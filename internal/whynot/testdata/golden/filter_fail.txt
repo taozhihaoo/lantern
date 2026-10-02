@@ -1,0 +1,6 @@
+why-not: query="release ext:go" path=normal.md
+子句层:
+  [filter_fail] ext:=go — 扩展名不匹配
+    实际: md / 要求: go
+建议层:
+  移除子句 "ext:=go" 后可命中:新查询 "release",估计排名 1/1
