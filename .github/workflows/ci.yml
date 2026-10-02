@@ -1,0 +1,66 @@
+# CI 门禁(与 Makefile 门禁一一对应):
+# gofmt / go vet / 零 require 校验 / go test / go test -race /
+# windows+darwin+linux 交叉编译 / fuzz 短模式(3×20s)/ demo 冒烟。
+#
+# - race 放 ubuntu(自带 gcc;-race 在 Windows 需要 mingw,规格 1 同时
+#   禁止 cgo,交叉编译用 CGO_ENABLED=0)。
+# - 全部测试仅标准库,无依赖安装步骤。
+name: CI
+
+on: [push, pull_request]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+
+      - name: gofmt(无未格式化文件)
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "::error::以下文件未通过 gofmt:"
+            echo "$out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go.mod 零 require(规格 1:仅标准库)
+        run: |
+          go build ./...
+          if grep -Eq '^\s*require' go.mod; then
+            echo "::error::go.mod 不得出现 require"
+            exit 1
+          fi
+
+      - name: go test
+        run: go test ./... -timeout 20m
+
+      - name: go test -race
+        run: go test -race ./... -timeout 25m
+
+      - name: 交叉编译(windows / darwin / linux)
+        run: |
+          CGO_ENABLED=0 GOOS=windows go build ./...
+          CGO_ENABLED=0 GOOS=darwin  go build ./...
+          CGO_ENABLED=0 GOOS=linux   go build ./...
+
+      - name: fuzz 短模式(每个目标 20s,规格 11.1)
+        run: |
+          go test -run=FuzzAnalyze        -fuzz=FuzzAnalyze        -fuzztime=20s ./internal/analysis
+          go test -run=FuzzCodecRoundtrip -fuzz=FuzzCodecRoundtrip -fuzztime=20s ./internal/codec
+          go test -run=FuzzLexer          -fuzz=FuzzLexer          -fuzztime=20s ./internal/query
+
+      - name: demo 冒烟(语料→索引→搜索→why-not→check)
+        run: bash scripts/demo.sh
