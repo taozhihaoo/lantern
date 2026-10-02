@@ -170,9 +170,22 @@ heartbeat),持有者每 5s 原位覆写;超过 30s 无心跳视为陈旧,打印�
 ## 8. 读取路径
 
 `SegmentReader.readAt` 经 LRU 块缓存(默认 64MB,键=段/文件/偏移/长度)
-以 `ReadAt` 读取,不使用 mmap(规格 5.10)。打开段时仅校验各文件 footer
-magic;完整 CRC 由 `lantern check`(CheckIndex)执行:段文件 CRC、meta
-解析、manifest 校验和比对、孤儿检测、状态表指向文档的存活校验。
+以 `ReadAt` 读取,不使用 mmap(规格 5.10)。norms.dat 与 dv.dat 为定宽数组,
+打开时整体载入内存,命中路径零随机读;docs.dat 记录支持只读记录头
+(`StoredDocLite`,不解压正文)。打开段时仅校验各文件 footer magic;完整
+CRC 由 `lantern check`(CheckIndex)执行:段文件 CRC、meta 解析、manifest
+校验和比对、孤儿检测、状态表指向文档的存活校验。
+
+性能关键路径(规格 12 实测驱动):
+
+- 打分安全树(纯 AND/词项/短语/过滤)按段预建词项游标,命中文档单调
+  推进使 `Advance` 均摊 O(1);OR/NOT 走递归求值保持分支得分语义(D16)。
+- 布尔场景的 postings 迭代器跳过位置数组解码(位置位于块尾,停止解析即可)。
+- `TermPrefix` 利用稀疏索引二分定位起始块(回退一块以覆盖块内中段),
+  只解码覆盖前缀的块。
+- 单字 CJK 展开使用 Searcher 级缓存的二元组首/尾索引(单字:两张表
+  二分;二字:等值),消除每次查询的全词典扫描。
+- Top-K 对不可能入堆的候选跳过存储字段读取。
 
 ## 9. 分析(internal/analysis)
 

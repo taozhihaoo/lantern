@@ -203,3 +203,5 @@ func newSearcherOf(snap *index.Snapshot) *query.Searcher {
 	s.SetRecency(0, 0, 1800000000)
 	return s
 }
+
+type indexTermEntry = index.TermEntry

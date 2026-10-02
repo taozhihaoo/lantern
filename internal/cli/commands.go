@@ -272,9 +272,6 @@ func cmdSearch(args []string) int {
 	s := newSearcherCLI(snap)
 	hl := parseDays(halfLife)
 	s.SetRecency(recency, hl, time.Now().Unix())
-	if os.Getenv("LANTERN_DEBUG") != "" {
-		fmt.Printf("debug: N=%d segs=%d q=%q\n", s.Stats().N, len(snap.Segments()), q)
-	}
 	res, err := s.Search(q, n, explain)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err) // 含列号与指示符(规格 2)

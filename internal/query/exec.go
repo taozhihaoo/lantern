@@ -97,7 +97,7 @@ type termIter struct {
 func newTermIter(se *segEnv, sc *scoreTerm, fields []index.Field) *termIter {
 	t := &termIter{se: se, sc: sc}
 	for _, f := range fields {
-		it, err := se.r.Postings(f, sc.text)
+		it, err := se.r.PostingsNoPos(f, sc.text)
 		if err != nil || it == nil {
 			continue
 		}

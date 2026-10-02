@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"runtime/pprof"
 	"sort"
 	"strings"
 	"time"
@@ -26,6 +27,7 @@ func main() {
 	qfile := flag.String("qfile", "", "查询文件(每行一条)")
 	mode := flag.String("mode", "and", "无 -qfile 时的查询模式: and/phrase/prefix/fuzzy")
 	num := flag.Int("n", 200, "执行次数")
+	cpuprofile := flag.String("cpuprofile", "", "写入 CPU profile(计时循环期间)")
 	flag.Parse()
 
 	ix, err := index.Open(*idxDir, fsx.OsFS())
@@ -64,6 +66,18 @@ func main() {
 	if len(queries) == 0 {
 		fmt.Fprintln(os.Stderr, "no queries")
 		os.Exit(1)
+	}
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		defer pprof.StopCPUProfile()
 	}
 	rng := rand.New(rand.NewSource(1))
 	var durs []time.Duration
@@ -119,14 +133,16 @@ func sampleQueries(snap *index.Snapshot, mode string) []string {
 			qs = append(qs, fmt.Sprintf("\"%s %s\"", pick(r), pick(r)))
 		case "prefix":
 			w := pick(r)
-			if len(w) > 2 {
-				w = w[:2]
+			rs := []rune(w)
+			if len(rs) > 2 {
+				w = string(rs[:2])
 			}
 			qs = append(qs, w+"*")
 		case "fuzzy":
 			w := pick(r)
-			if len(w) > 3 {
-				w = w[:len(w)-1]
+			rs := []rune(w)
+			if len(rs) > 3 {
+				w = string(rs[:len(rs)-1])
 			}
 			qs = append(qs, w+"~")
 		default: // and:三词 AND

@@ -9,6 +9,7 @@ import (
 	"io"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -62,6 +63,10 @@ type SegmentReader struct {
 
 	mu        sync.Mutex // 保护 skipCache
 	skipCache map[segTermKey][]skipEntry
+
+	// norms/dv 为定宽数组,打开时整载入内存,消除命中路径随机读。
+	normsData []byte
+	dvData    []byte
 
 	livePtr atomic.Pointer[codec.Bitset] // 当前墓碑位集
 	liveGen atomic.Uint32
@@ -137,6 +142,20 @@ func OpenSegment(fsys fsx.FS, dir, id string, cache *BlockCache) (*SegmentReader
 	}
 	if err := r.parseTermsIdx(idxData); err != nil {
 		return fail(err)
+	}
+
+	// norms.dat / dv.dat 整载(定宽小数组)。
+	if r.normsData, err = r.readFilePayload(fNorms); err != nil {
+		return fail(err)
+	}
+	if int64(len(r.normsData)) != int64(r.nDocs)*int64(NumFields)*4 {
+		return fail(fmt.Errorf("index: norms.dat size mismatch in %s", id))
+	}
+	if r.dvData, err = r.readFilePayload(fDV); err != nil {
+		return fail(err)
+	}
+	if int64(len(r.dvData)) != int64(r.nDocs)*20 {
+		return fail(fmt.Errorf("index: dv.dat size mismatch in %s", id))
 	}
 
 	// live_0.bits。
@@ -429,6 +448,15 @@ func (r *SegmentReader) Terms(field Field, fn func(term string, e TermEntry) boo
 // Postings 返回词项的倒排迭代器(自动跳过墓碑文档);
 // 词项不存在时返回 nil。
 func (r *SegmentReader) Postings(field Field, term string) (*PostingIterator, error) {
+	return r.postings(field, term, true)
+}
+
+// PostingsNoPos 返回跳过位置解码的迭代器(AND/OR 等布尔场景)。
+func (r *SegmentReader) PostingsNoPos(field Field, term string) (*PostingIterator, error) {
+	return r.postings(field, term, false)
+}
+
+func (r *SegmentReader) postings(field Field, term string, needPos bool) (*PostingIterator, error) {
 	te, ok, err := r.Term(field, term)
 	if err != nil {
 		return nil, err
@@ -436,7 +464,7 @@ func (r *SegmentReader) Postings(field Field, term string) (*PostingIterator, er
 	if !ok {
 		return nil, nil
 	}
-	return &PostingIterator{r: r, field: field, term: term, entry: te}, nil
+	return &PostingIterator{r: r, field: field, term: term, entry: te, needPos: needPos}, nil
 }
 
 // PostingIterator 是一个词项内的文档游标。
@@ -455,6 +483,9 @@ type PostingIterator struct {
 	pos    [][]uint32
 	cur    int
 	done   bool
+	// needPos=false 时块解码跳过位置数组(纯布尔/AND 场景;
+	// 位置位于块尾,跳过即停止解析)。
+	needPos bool
 }
 
 // DocFreq 返回词项文档频率(含已删除未合并)。
@@ -526,7 +557,7 @@ func (it *PostingIterator) loadBlock(i int) error {
 	if !first {
 		base = it.skips[i-1].maxDoc
 	}
-	docs, tfs, pos, err := decodePostingsBlock(payload, first, base)
+	docs, tfs, pos, err := decodePostingsBlock(payload, first, base, it.needPos)
 	if err != nil {
 		return err
 	}
@@ -539,7 +570,7 @@ func (it *PostingIterator) loadBlock(i int) error {
 	return nil
 }
 
-func decodePostingsBlock(payload []byte, first bool, baseDoc uint32) ([]uint32, []uint32, [][]uint32, error) {
+func decodePostingsBlock(payload []byte, first bool, baseDoc uint32, needPos bool) ([]uint32, []uint32, [][]uint32, error) {
 	n, sz := binary.Uvarint(payload)
 	if sz <= 0 || n > 1<<20 {
 		return nil, nil, nil, fmt.Errorf("index: postings block bad count")
@@ -570,6 +601,10 @@ func decodePostingsBlock(payload []byte, first bool, baseDoc uint32) ([]uint32, 
 		}
 		pos += s
 		tfs[i] = uint32(tf)
+	}
+	if !needPos {
+		// 位置在块尾:布尔场景直接停止解析。
+		return docs, tfs, nil, nil
 	}
 	posArr := make([][]uint32, n)
 	for i := 0; i < int(n); i++ {
@@ -680,27 +715,21 @@ func (it *PostingIterator) Advance(target uint32) bool {
 	return false
 }
 
-// Norm 读取某文档某字段的长度。
+// Norm 读取某文档某字段的长度(打开时已整载内存)。
 func (r *SegmentReader) Norm(docID uint32, field Field) (uint32, error) {
 	if docID >= r.nDocs {
 		return 0, fmt.Errorf("index: docID %d out of range in %s", docID, r.ID)
 	}
-	buf, err := r.readAt(fNorms, int64(docID)*int64(NumFields)*4+int64(field)*4, 4)
-	if err != nil {
-		return 0, err
-	}
-	return binary.LittleEndian.Uint32(buf), nil
+	off := int64(docID)*int64(NumFields)*4 + int64(field)*4
+	return binary.LittleEndian.Uint32(r.normsData[off:]), nil
 }
 
-// DocValues 读取某文档的 ext/size/mtime。
+// DocValues 读取某文档的 ext/size/mtime(打开时已整载内存)。
 func (r *SegmentReader) DocValues(docID uint32) (DV, error) {
 	if docID >= r.nDocs {
 		return DV{}, fmt.Errorf("index: docID %d out of range in %s", docID, r.ID)
 	}
-	buf, err := r.readAt(fDV, int64(docID)*20, 20)
-	if err != nil {
-		return DV{}, err
-	}
+	buf := r.dvData[int64(docID)*20:]
 	extID := binary.LittleEndian.Uint32(buf[16:20])
 	ext := ""
 	if int(extID) < len(r.extDict) {
@@ -711,6 +740,45 @@ func (r *SegmentReader) DocValues(docID uint32) (DV, error) {
 		Size:  int64(binary.LittleEndian.Uint64(buf[8:16])),
 		Ext:   ext,
 	}, nil
+}
+
+// StoredDocLite 只读取 path/title(搜索命中循环用,避免解压正文)。
+func (r *SegmentReader) StoredDocLite(docID uint32) (path, title string, err error) {
+	if docID >= r.nDocs {
+		return "", "", fmt.Errorf("index: docID %d out of range in %s", docID, r.ID)
+	}
+	offBuf, err := r.readAt(fDocsIdx, 4+int64(docID)*8, 16)
+	if err != nil {
+		return "", "", err
+	}
+	start := binary.LittleEndian.Uint64(offBuf[0:8])
+	end := binary.LittleEndian.Uint64(offBuf[8:16])
+	if end < start {
+		return "", "", fmt.Errorf("index: docs.idx inverted offsets in %s", r.ID)
+	}
+	rec, err := r.readAt(fDocs, int64(start), int(end-start))
+	if err != nil {
+		return "", "", err
+	}
+	return decodeStoredDocLite(rec)
+}
+
+func decodeStoredDocLite(rec []byte) (string, string, error) {
+	pos := 0
+	plen, sz := binary.Uvarint(rec[pos:])
+	if sz <= 0 || pos+sz+int(plen) > len(rec) {
+		return "", "", fmt.Errorf("index: stored doc bad path len")
+	}
+	pos += sz
+	path := string(rec[pos : pos+int(plen)])
+	pos += int(plen)
+	tlen, sz := binary.Uvarint(rec[pos:])
+	if sz <= 0 || pos+sz+int(tlen) > len(rec) {
+		return "", "", fmt.Errorf("index: stored doc bad title len")
+	}
+	pos += sz
+	title := string(rec[pos : pos+int(tlen)])
+	return path, title, nil
 }
 
 // StoredDoc 读取某文档的存储字段。
@@ -852,4 +920,50 @@ func (r *SegmentReader) TermsSorted(field Field) ([]string, error) {
 	})
 	sort.Strings(out)
 	return out, err
+}
+
+// TermPrefix 遍历字段词典中所有以 prefix 开头的词项(利用稀疏索引
+// 定位起始块,只解码覆盖范围内的块)。
+func (r *SegmentReader) TermPrefix(field Field, prefix string, fn func(term string, e TermEntry) bool) error {
+	// 二分:第一个 (field, term) >= (field, prefix) 的块。
+	lo, hi := 0, len(r.termsIdx)-1
+	start := len(r.termsIdx)
+	for lo <= hi {
+		mid := int(uint(lo+hi) >> 1)
+		e := r.termsIdx[mid]
+		if e.field > field || (e.field == field && e.term >= prefix) {
+			start = mid
+			hi = mid - 1
+		} else {
+			lo = mid + 1
+		}
+	}
+	// 起始块回退一块:首个 >= prefix 的词项可能位于块首词更小的块中
+	// (跨字段边界或处于块内中段)。
+	if start > 0 {
+		start--
+	}
+	prefixMax := prefix + "\xff\xff\xff\xff"
+	for i := start; i < len(r.termsIdx); i++ {
+		blk := r.termsIdx[i]
+		if i > start && blk.term > prefixMax {
+			break
+		}
+		ents, err := r.readTermsBlock(blk.off)
+		if err != nil {
+			return err
+		}
+		for _, en := range ents {
+			if en.field != field {
+				continue
+			}
+			if !strings.HasPrefix(en.term, prefix) {
+				continue
+			}
+			if !fn(en.term, en.entry) {
+				return nil
+			}
+		}
+	}
+	return nil
 }

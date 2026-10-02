@@ -8,8 +8,7 @@ func (s *Searcher) EvaluateClause(n Node, segID string, doc uint32) (bool, float
 		return false, 0
 	}
 	trunc := false
-	pl := newPlanner(s.segs, s.stats, s.params, &trunc)
-	plan := pl.toPlan(n)
+	plan := s.plannerFor(&trunc).toPlan(n)
 	m, score, _ := s.evalNode(plan, seg.Reader(), doc)
 	return m, score
 }
@@ -22,7 +21,7 @@ func (s *Searcher) RankOf(q string, targetPath string) (found bool, rank int, to
 		return false, 0, 0, 0
 	}
 	trunc := false
-	pl := newPlanner(s.segs, s.stats, s.params, &trunc)
+	pl := s.plannerFor(&trunc)
 	plan := &Plan{root: pl.toPlan(node), terms: pl.termOrder, truncated: trunc, query: q}
 	avg := s.avgLens()
 	type cand struct {
@@ -39,10 +38,10 @@ func (s *Searcher) RankOf(q string, targetPath string) (found bool, rank int, to
 		}
 		for it.Next() {
 			total++
-			sc := s.scoreDoc(plan, seg, it.DocID())
-			path := ""
-			if sd, err := seg.Reader().StoredDoc(it.DocID()); err == nil {
-				path = sd.Path
+			sc := s.evalScoreDoc(plan, seg, it.DocID())
+			path, _, err := seg.Reader().StoredDocLite(it.DocID())
+			if err != nil {
+				path = ""
 			}
 			if path == targetPath {
 				target = &cand{path: path, score: sc}

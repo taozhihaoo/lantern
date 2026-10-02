@@ -132,12 +132,23 @@ func (p *phrasePlan) build(se *segEnv) DocIterator {
 func (p *phrasePlan) slopFor() int { return p.slop }
 
 // planner 把 AST 编译为 Plan。
+// cjkBigrams 是一个 (段,字段) 的 CJK 二元组索引:
+// first 按首字排序,second 按尾字排序(单字展开二分用)。
+type cjkBigrams struct {
+	first  []string
+	second []string
+}
+
+// planner 需要的 Field 别名。
+type Field = index.Field
+
 type planner struct {
 	segs      []*index.SegmentRef
 	stats     rank.Stats
 	params    rank.Params
 	dfCache   map[string]*scoreTerm
-	dictMu    map[string][]string // (segID|field) → 有序词典缓存
+	dictMu    map[string][]string // (segID|field) → 有序词典缓存(模糊用)
+	cjkHook   func(segID string, f Field) cjkBigrams
 	budget    int
 	trunc     *bool
 	termOrder []*scoreTerm // 打分词项顺序(Explain 用;NOT 子树不计分)
@@ -155,6 +166,16 @@ func newPlanner(segs []*index.SegmentRef, st rank.Stats, params rank.Params, tru
 		trunc:   trunc,
 	}
 }
+
+// newPlannerWithCJK 注入 CJK 二元组索引钩子(Searcher 级缓存)。
+func newPlannerWithCJK(segs []*index.SegmentRef, st rank.Stats, params rank.Params,
+	trunc *bool, hook func(segID string, f Field) cjkBigrams) *planner {
+	pl := newPlanner(segs, st, params, trunc)
+	pl.cjkHook = hook
+	return pl
+}
+
+// newPlannerWithCJK 在 newPlanner 基础上注入 CJK 二元组索引钩子。
 
 // Compile 把 AST 编译为 Plan。
 func Compile(n Node, segs []*index.SegmentRef, st rank.Stats, params rank.Params) (*Plan, error) {
@@ -382,15 +403,12 @@ func (pl *planner) consumeBudget() bool {
 	return true
 }
 
-// planPrefix 前缀展开:扫描范围内全部词典,收集前缀匹配词项。
+// planPrefix 前缀展开:TermPrefix 走稀疏索引只解码覆盖块(规格 6)。
 func (pl *planner) planPrefix(prefix string, fields []index.Field) planNode {
 	agg := map[string]*scoreTerm{}
 	for _, seg := range pl.segs {
 		for _, f := range fields {
-			_ = seg.Reader().Terms(f, func(term string, te index.TermEntry) bool {
-				if !strings.HasPrefix(term, prefix) {
-					return true
-				}
+			_ = seg.Reader().TermPrefix(f, prefix, func(term string, te index.TermEntry) bool {
 				sc := agg[term]
 				if sc == nil {
 					if !pl.consumeBudget() {
@@ -462,29 +480,62 @@ func (pl *planner) planFuzzy(term string, dist int, fields []index.Field) planNo
 }
 
 // planSingleCJK 单字 CJK:展开为词典中所有包含该字的二元组
-// (DECISIONS.md D5)。
+// (DECISIONS.md D5)。利用 Searcher 级缓存的二元组首/尾索引做二分,
+// 避免每次查询全词典扫描。
 func (pl *planner) planSingleCJK(ch string, fields []index.Field) planNode {
 	agg := map[string]*scoreTerm{}
+	addTerm := func(seg *index.SegmentRef, f index.Field, term string) {
+		sc := agg[term]
+		if sc == nil {
+			if !pl.consumeBudget() {
+				return
+			}
+			sc = &scoreTerm{text: term, weight: 1, fields: fields}
+			agg[term] = sc
+		}
+		if te, ok, err := seg.Reader().Term(f, term); err == nil && ok {
+			sc.dfByField[f] += uint64(te.DocFreq)
+		}
+	}
 	for _, seg := range pl.segs {
 		for _, f := range fields {
-			_ = seg.Reader().Terms(f, func(term string, te index.TermEntry) bool {
-				if len(term) != 6 { // 仅二元组(UTF-8 3B×2)
-					return true
-				}
-				if !strings.Contains(term, ch) {
-					return true
-				}
-				sc := agg[term]
-				if sc == nil {
-					if !pl.consumeBudget() {
-						return false
+			if pl.cjkHook == nil {
+				// 无钩子(Compile 直连):退化为全词典扫描。
+				_ = seg.Reader().Terms(f, func(term string, te index.TermEntry) bool {
+					if len(term) != 6 || !strings.Contains(term, ch) {
+						return true
 					}
-					sc = &scoreTerm{text: term, weight: 1, fields: fields}
-					agg[term] = sc
+					if sc := agg[term]; sc == nil {
+						if !pl.consumeBudget() {
+							return false
+						}
+						agg[term] = &scoreTerm{text: term, weight: 1, fields: fields}
+					}
+					agg[term].dfByField[f] += uint64(te.DocFreq)
+					return true
+				})
+				continue
+			}
+			bi := pl.cjkHook(seg.ID(), f)
+			if len(ch) == 3 {
+				// 单字:首字 = ch 的连续区段 + 尾字 = ch(second 键 =
+				// 尾字+首字,须还原为真实词项)。
+				lo := sort.SearchStrings(bi.first, ch)
+				for i := lo; i < len(bi.first) && strings.HasPrefix(bi.first[i], ch); i++ {
+					addTerm(seg, f, bi.first[i])
 				}
-				sc.dfByField[f] += uint64(te.DocFreq)
-				return true
-			})
+				lo = sort.SearchStrings(bi.second, ch)
+				for i := lo; i < len(bi.second) && strings.HasPrefix(bi.second[i], ch); i++ {
+					key := bi.second[i]
+					addTerm(seg, f, key[3:]+key[:3])
+				}
+				continue
+			}
+			// 二元组 ch(6 字节):只可能是词项本身(包含语义退化为相等)。
+			lo := sort.SearchStrings(bi.first, ch)
+			if lo < len(bi.first) && bi.first[lo] == ch {
+				addTerm(seg, f, ch)
+			}
 		}
 	}
 	return pl.buildExpansion(ch, agg, fields)

@@ -3,6 +3,7 @@ package query
 import (
 	"container/heap"
 	"sort"
+	"sync"
 
 	"lantern/internal/index"
 	"lantern/internal/rank"
@@ -66,6 +67,12 @@ func entryBetter(a, worst topEntry) bool {
 	return a.path < worst.path
 }
 
+// worth 报告该分数是否可能进入堆(未满,或不劣于当前最差);
+// 用于跳过不可能入堆候选的存储字段读取。
+func (h *topK) worth(score float64) bool {
+	return len(h.data) < h.k || (h.Len() > 0 && score >= h.data[0].score)
+}
+
 func (h *topK) offer(e topEntry) {
 	if h.k <= 0 {
 		return
@@ -90,6 +97,15 @@ type Searcher struct {
 	recencyR        float64
 	recencyHalfLife float64
 	recencyNow      int64 // unix 秒
+
+	// CJK 二元组索引缓存(单字展开加速;并发安全)。
+	cjkMu    sync.Mutex
+	cjkCache map[cjkKey]cjkBigrams
+}
+
+// plannerFor 创建本快照的 planner(带 CJK 缓存钩子)。
+func (s *Searcher) plannerFor(trunc *bool) *planner {
+	return newPlannerWithCJK(s.segs, s.stats, s.params, trunc, s.cjkBigramsFor)
 }
 
 // NewSearcher 创建搜索器并跨段汇总统计(规格 7.1)。
@@ -142,22 +158,40 @@ func (s *Searcher) Search(q string, k int, wantExplain bool) (*Result, error) {
 		return nil, err
 	}
 	trunc := false
-	pl := newPlanner(s.segs, s.stats, s.params, &trunc)
+	pl := s.plannerFor(&trunc)
 	root := pl.toPlan(node)
 	plan := &Plan{root: root, terms: pl.termOrder, truncated: trunc, query: q}
 
 	avg := s.avgLens()
 	tk := &topK{k: k}
 	var total uint64
+	safe := scoringSafe(plan.root)
 	for _, seg := range s.segs {
 		se := &segEnv{r: seg.Reader(), params: s.params, avg: avg}
 		it := plan.root.build(se)
 		if it == nil {
 			continue
 		}
+		// 打分安全树(纯 AND/词项/短语/过滤):按段预建词项游标,
+		// 命中文档递增推进使 Advance 均摊 O(1);OR/NOT 走递归求值。
+		var ss *segScorer
+		if safe {
+			ss = newSegScorer(s, plan, seg.Reader())
+		}
 		for it.Next() {
 			total++
-			score := s.scoreDoc(plan, seg, it.DocID())
+			var score float64
+			if ss != nil {
+				score = ss.score(it.DocID(), nil)
+			} else {
+				score = s.evalScoreDoc(plan, seg, it.DocID())
+			}
+			if boost, ok := s.boostOf(seg.Reader(), it.DocID()); ok {
+				score *= boost
+			}
+			if !tk.worth(score) {
+				continue
+			}
 			path, title := "", ""
 			if sd, err := seg.Reader().StoredDoc(it.DocID()); err == nil {
 				path = sd.Path
@@ -373,12 +407,10 @@ func groupMatches(posLists [][]uint32, slop int) bool {
 	return best <= limit
 }
 
-// scoreDoc 计算单个文档最终得分(匹配树已确认命中)。
-func (s *Searcher) scoreDoc(plan *Plan, seg *index.SegmentRef, doc uint32) float64 {
-	r := seg.Reader()
-	_, score, _ := s.evalNode(plan.root, r, doc)
-	boost := s.boostOf(r, doc)
-	return score * boost
+// evalScoreDoc 对单个文档求值(不含 recency boost;由调用方乘一次)。
+func (s *Searcher) evalScoreDoc(plan *Plan, seg *index.SegmentRef, doc uint32) float64 {
+	_, score, _ := s.evalNode(plan.root, seg.Reader(), doc)
+	return score
 }
 
 // scoreDocExplain 计算得分并输出拆解:贡献 = raw·boost,
@@ -389,7 +421,7 @@ func (s *Searcher) scoreDocExplain(plan *Plan, seg *index.SegmentRef, doc uint32
 	if !matched {
 		return 0, nil
 	}
-	boost := s.boostOf(r, doc)
+	boost, _ := s.boostOf(r, doc)
 	byTerm := map[*scoreTerm]float64{}
 	sum := 0.0
 	for _, c := range contribs {
@@ -409,13 +441,141 @@ func (s *Searcher) scoreDocExplain(plan *Plan, seg *index.SegmentRef, doc uint32
 	return sum, ex
 }
 
-func (s *Searcher) boostOf(r *index.SegmentReader, doc uint32) float64 {
+func (s *Searcher) boostOf(r *index.SegmentReader, doc uint32) (float64, bool) {
 	if dv, err := r.DocValues(doc); err == nil {
 		return rank.RecencyBoost(s.recencyR, s.recencyHalfLife,
-			float64(s.recencyNow-dv.MTime)/86400.0)
+			float64(s.recencyNow-dv.MTime)/86400.0), true
 	}
-	return 1
+	return 1, false
 }
 
 // Stats 返回搜索器的全局统计(诊断用)。
 func (s *Searcher) Stats() rank.Stats { return s.stats }
+
+// scoringSafe 报告 plan 树是否可用 segScorer 线性打分:
+// 不含 OR/NOT(它们的分支得分语义需要递归求值)。
+func scoringSafe(p planNode) bool {
+	switch t := p.(type) {
+	case *termPlan, *allPlan, *phrasePlan:
+		return true
+	case *andPlan:
+		for _, c := range t.pos {
+			if !scoringSafe(c) {
+				return false
+			}
+		}
+		for _, c := range t.negs {
+			if !scoringSafe(c) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// segScorer 按段预建全部打分词项的 postings 游标。
+// 匹配迭代按 docID 递增产出,Advance 均摊 O(1),避免每个命中文档
+// 重新做词典查找。
+type segScorer struct {
+	s     *Searcher
+	r     *index.SegmentReader
+	avg   [index.NumFields]float64
+	terms []termCursor
+}
+
+type termCursor struct {
+	sc  *scoreTerm
+	its [index.NumFields]*index.PostingIterator
+}
+
+func newSegScorer(s *Searcher, plan *Plan, r *index.SegmentReader) *segScorer {
+	ss := &segScorer{s: s, r: r, avg: s.avgLens()}
+	for _, sc := range plan.terms {
+		var tc termCursor
+		tc.sc = sc
+		for _, f := range sc.fields {
+			it, err := r.Postings(f, sc.text)
+			if err == nil && it != nil {
+				tc.its[f] = it
+			}
+		}
+		ss.terms = append(ss.terms, tc)
+	}
+	return ss
+}
+
+// score 计算单个文档的词项贡献之和(acc 非 nil 时按词项累加,供 Explain)。
+// 语义与 evalNode 在"打分安全树"下完全一致:Σ 词项贡献,无 OR/NOT 分支。
+func (ss *segScorer) score(doc uint32, acc map[*scoreTerm]float64) float64 {
+	sum := 0.0
+	for ti := range ss.terms {
+		tc := &ss.terms[ti]
+		var tf, ln [index.NumFields]float64
+		any := false
+		for _, f := range tc.sc.fields {
+			it := tc.its[f]
+			if it == nil {
+				continue
+			}
+			if !it.Advance(doc) || it.DocID() != doc {
+				continue
+			}
+			tf[f] = float64(it.TF())
+			if n, err := ss.r.Norm(doc, f); err == nil {
+				ln[f] = float64(n)
+			}
+			any = true
+		}
+		if !any {
+			continue
+		}
+		tfw := rank.TFW(ss.s.params, tf, ln, ss.avg)
+		if tfw <= 0 {
+			continue
+		}
+		c := rank.TermScore(ss.s.params, tc.sc.idf, tfw, tc.sc.weight)
+		sum += c
+		if acc != nil {
+			acc[tc.sc] += c
+		}
+	}
+	return sum
+}
+
+// cjkKey 标识一个 (段,字段) 的二元组索引。
+type cjkKey struct{ seg, field string }
+
+// cjkBigramsFor 惰性构建并缓存 (段,字段) 的 CJK 二元组首/尾索引。
+// 单字 CJK 展开的高频路径因此只需两次二分(见 planSingleCJK / D5)。
+func (s *Searcher) cjkBigramsFor(segID string, f index.Field) cjkBigrams {
+	s.cjkMu.Lock()
+	defer s.cjkMu.Unlock()
+	if s.cjkCache == nil {
+		s.cjkCache = map[cjkKey]cjkBigrams{}
+	}
+	key := cjkKey{segID, f.Name()}
+	if b, ok := s.cjkCache[key]; ok {
+		return b
+	}
+	var first, second []string
+	for _, seg := range s.segs {
+		if seg.ID() != segID {
+			continue
+		}
+		_ = seg.Reader().Terms(f, func(term string, _ index.TermEntry) bool {
+			// CJK 字符在 UTF-8 中均为 3 字节,二元组定长 6。
+			if len(term) == 6 {
+				first = append(first, term)
+				second = append(second, term[3:]+term[:3])
+			}
+			return true
+		})
+		break
+	}
+	sort.Strings(first)
+	sort.Strings(second)
+	b := cjkBigrams{first: first, second: second}
+	s.cjkCache[key] = b
+	return b
+}

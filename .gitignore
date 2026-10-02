@@ -2,3 +2,5 @@
 *.out
 .lantern/
 dist/
+.bench/
+corpus/

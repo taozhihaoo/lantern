@@ -77,7 +77,7 @@ func scope(hasField bool, f index.Field) []index.Field {
 }
 
 // Search 返回 Top-K 与总命中数。结果按 (score desc, path asc)。
-func (b *Brute) Search(q string, k int) ([]BruteResult, int, error) {
+func (b *Brute) Search(q string, k int, _ ...bool) ([]BruteResult, int, error) {
 	node, err := query.Parse(q)
 	if err != nil {
 		return nil, 0, err
