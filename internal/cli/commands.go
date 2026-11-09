@@ -80,9 +80,9 @@ func printSummary(sum *scan.Summary) {
 		elapsed, float64(sum.Bytes)/1024/1024, tp, sum.FilesSeen)
 }
 
-func scanOptsFor(ix *index.Index, base string, targets []string, workers int, noStore bool) scan.Options {
+func scanOptsFor(ix *index.Index, base string, targets []string, workers int, maxSize int64, noStore bool) scan.Options {
 	return scan.Options{
-		Base: base, Targets: targets, Workers: workers, NoStoreBody: noStore,
+		Base: base, Targets: targets, Workers: workers, MaxSize: maxSize, NoStoreBody: noStore,
 		State: func(p string) (scan.StateEntry, bool) {
 			info, ok := ix.StateInfoOf(p)
 			if !ok {
@@ -102,7 +102,11 @@ func cmdIndex(args []string) int {
 		fmt.Fprintln(os.Stderr, "lantern index: 参数错误")
 		return ExitUsage
 	}
-	workers := pv.int("workers", runtime.GOMAXPROCS(0))
+	workers, err := pv.intInRange("workers", runtime.GOMAXPROCS(0), 1, 256)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "lantern index: %v\n", err)
+		return ExitUsage
+	}
 	maxSize := pv.str("max-size", "2MB")
 	noStore := pv.boolean("no-store-body")
 	if len(targets) == 0 {
@@ -164,8 +168,22 @@ func cmdWatch(args []string) int {
 		fmt.Fprintln(os.Stderr, "lantern watch: 参数错误")
 		return ExitUsage
 	}
-	interval := time.Duration(pv.float("interval", 2) * float64(time.Second))
-	workers := pv.int("workers", runtime.GOMAXPROCS(0))
+	intervalSec := pv.float("interval", 2)
+	if intervalSec <= 0 || intervalSec > 3600 {
+		fmt.Fprintln(os.Stderr, "lantern watch: --interval 必须在 0..3600 秒之间")
+		return ExitUsage
+	}
+	interval := time.Duration(intervalSec * float64(time.Second))
+	workers, werr := pv.intInRange("workers", runtime.GOMAXPROCS(0), 1, 256)
+	if werr != nil {
+		fmt.Fprintf(os.Stderr, "lantern watch: %v\n", werr)
+		return ExitUsage
+	}
+	limit, serr := parseSizeFlag(pv.str("max-size", "2MB"))
+	if serr != nil {
+		fmt.Fprintf(os.Stderr, "lantern watch: %v\n", serr)
+		return ExitUsage
+	}
 	noStore := pv.boolean("no-store-body")
 	if len(targets) == 0 {
 		fmt.Fprintln(os.Stderr, "lantern watch: 需要至少一个目录")
@@ -189,9 +207,18 @@ func cmdWatch(args []string) int {
 	fmt.Printf("watching %s (interval %s),Ctrl-C 退出\n", strings.Join(targets, ", "), interval)
 
 	for {
-		outs, deletes, sum, err := scan.Run(scanOptsFor(ix, base, targets, workers, noStore))
+		outs, deletes, sum, err := scan.Run(scanOptsFor(ix, base, targets, workers, limit, noStore))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "lantern watch: %v\n", err)
+			// 扫描失败时不能提交任何变更(尤其是删除),等待下一轮重试。
+			select {
+			case <-sig:
+				w.Close()
+				fmt.Println("watch 退出,已提交数据一致")
+				return ExitOK
+			case <-time.After(interval):
+				continue
+			}
 		}
 		if len(outs) == 0 && len(deletes) == 0 {
 			select {
@@ -203,26 +230,36 @@ func cmdWatch(args []string) int {
 				continue
 			}
 		}
-		// 去抖:一个间隔内仍有新变化则继续合并,安静后才提交。
+		// 去抖:每隔 interval 重扫一次,直到出现一个安静间隔。每轮都基于
+		// 同一份(尚未提交的)索引状态重新计算完整差异,因此用最新一轮的
+		// 结果整体替换,而不是累加——累加会重复 AddDoc 同一路径,且汇总
+		// 只反映第一轮。
 	interruptible:
 		for {
 			select {
 			case <-sig:
 				break interruptible
 			case <-time.After(interval):
-				more, moreDel, _, err2 := scan.Run(scanOptsFor(ix, base, targets, workers, noStore))
+				more, moreDel, moreSum, err2 := scan.Run(scanOptsFor(ix, base, targets, workers, limit, noStore))
 				if err2 != nil || (len(more) == 0 && len(moreDel) == 0) {
 					break interruptible
 				}
-				outs = append(outs, more...)
-				deletes = append(deletes, moreDel...)
+				outs, deletes, sum = more, moreDel, moreSum
 			}
 		}
 		for _, d := range outs {
-			_ = w.AddDoc(d.Doc)
+			if err := w.AddDoc(d.Doc); err != nil {
+				fmt.Fprintf(os.Stderr, "lantern watch: 添加文档 %s: %v\n", d.Path, err)
+				w.Close()
+				return ExitErr
+			}
 		}
 		for _, p := range deletes {
-			_ = w.DeleteDoc(p)
+			if err := w.DeleteDoc(p); err != nil {
+				fmt.Fprintf(os.Stderr, "lantern watch: 删除文档 %s: %v\n", p, err)
+				w.Close()
+				return ExitErr
+			}
 		}
 		sum.Deleted = len(deletes)
 		if err := w.Flush(); err != nil {
@@ -249,7 +286,11 @@ func cmdSearch(args []string) int {
 		fmt.Fprintln(os.Stderr, "lantern search: 参数错误")
 		return ExitUsage
 	}
-	n := pv.int("n", 10)
+	n, nerr := pv.intInRange("n", 10, 1, 1000)
+	if nerr != nil {
+		fmt.Fprintf(os.Stderr, "lantern search: %v\n", nerr)
+		return ExitUsage
+	}
 	jsonOut := pv.boolean("json")
 	explain := pv.boolean("explain")
 	noColor := pv.boolean("no-color")

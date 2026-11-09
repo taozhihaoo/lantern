@@ -1,6 +1,11 @@
 *.test
+*.test.exe
 *.out
 .lantern/
 dist/
+bin/
 .bench/
 corpus/
+.tmp/
+node_modules/
+.workbuddy/

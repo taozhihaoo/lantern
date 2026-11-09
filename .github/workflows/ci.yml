@@ -1,10 +1,11 @@
-# CI 门禁(与 Makefile 门禁一一对应):
-# gofmt / go vet / 零 require 校验 / go test / go test -race /
-# windows+darwin+linux 交叉编译 / fuzz 短模式(3×20s)/ demo 冒烟。
+# CI gates (kept in sync with the Makefile):
+#   gofmt / go vet / zero-require check / go test / go test -race /
+#   windows+darwin+linux cross-build / fuzz short mode / demo smoke /
+#   embedded UI & documentation assets / HTTP smoke / Windows test job.
 #
-# - race 放 ubuntu(自带 gcc;-race 在 Windows 需要 mingw,规格 1 同时
-#   禁止 cgo,交叉编译用 CGO_ENABLED=0)。
-# - 全部测试仅标准库,无依赖安装步骤。
+# -race runs on ubuntu (gcc is available; race on Windows needs mingw, and
+# cross-builds use CGO_ENABLED=0).
+# Every test uses only the standard library: no dependency install step.
 name: CI
 
 on: [push, pull_request]
@@ -16,7 +17,7 @@ concurrency:
 jobs:
   gates:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -24,11 +25,11 @@ jobs:
         with:
           go-version: '1.22.x'
 
-      - name: gofmt(无未格式化文件)
+      - name: gofmt (no unformatted files)
         run: |
           out=$(gofmt -l .)
           if [ -n "$out" ]; then
-            echo "::error::以下文件未通过 gofmt:"
+            echo "::error::unformatted files:"
             echo "$out"
             exit 1
           fi
@@ -36,11 +37,11 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      - name: go.mod 零 require(规格 1:仅标准库)
+      - name: go.mod has zero require (standard library only)
         run: |
           go build ./...
           if grep -Eq '^\s*require' go.mod; then
-            echo "::error::go.mod 不得出现 require"
+            echo "::error::go.mod must not contain require"
             exit 1
           fi
 
@@ -50,17 +51,103 @@ jobs:
       - name: go test -race
         run: go test -race ./... -timeout 25m
 
-      - name: 交叉编译(windows / darwin / linux)
+      - name: cross-build (windows / darwin / linux)
         run: |
           CGO_ENABLED=0 GOOS=windows go build ./...
           CGO_ENABLED=0 GOOS=darwin  go build ./...
           CGO_ENABLED=0 GOOS=linux   go build ./...
 
-      - name: fuzz 短模式(每个目标 20s,规格 11.1)
+      - name: embedded UI is offline and bilingual
+        run: |
+          if grep -Eq 'https?://|cdn\.|unpkg|jsdelivr|fonts\.googleapis' internal/server/ui/index.html; then
+            echo "::error::the embedded UI references an external resource"
+            exit 1
+          fi
+          for key in '"en"' '"zh"'; do
+            grep -q "$key" internal/server/ui/index.html || {
+              echo "::error::missing UI locale $key"; exit 1; }
+          done
+          grep -q 'lang="en"' internal/server/ui/index.html
+          echo "UI is offline and ships en + zh"
+
+      - name: README / screenshot / license assets
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, struct
+          shots = {
+              "docs/screenshots/ui-en.png": "README.md",
+              "docs/screenshots/ui-en-diagnose.png": "README.md",
+              "docs/screenshots/ui-zh.png": "README.zh-CN.md",
+              "docs/screenshots/ui-zh-diagnose.png": "README.zh-CN.md",
+          }
+          for path, owner in shots.items():
+              p = pathlib.Path(path)
+              assert p.exists(), f"missing screenshot {path}"
+              data = p.read_bytes()
+              assert data[:8] == b"\x89PNG\r\n\x1a\n", f"{path} is not a PNG"
+              w, h = struct.unpack(">II", data[16:24])
+              assert w >= 800 and h >= 400, f"{path} too small: {w}x{h}"
+              text = pathlib.Path(owner).read_text(encoding="utf-8")
+              assert path in text, f"{owner} does not reference {path}"
+          en = pathlib.Path("README.md").read_text(encoding="utf-8")
+          zh = pathlib.Path("README.zh-CN.md").read_text(encoding="utf-8")
+          # Each README must use its own language's screenshots.
+          assert "ui-zh" not in en, "English README must not embed Chinese screenshots"
+          assert "ui-en" not in zh, "Chinese README must not embed English screenshots"
+          for name, text in (("README.md", en), ("README.zh-CN.md", zh)):
+              for section in ("## Security", "## License"):
+                  assert section in text, f"{name} misses {section}"
+          assert pathlib.Path("LICENSE").exists(), "LICENSE missing"
+          print("documentation assets OK")
+          PY
+          make ui-check docs-check
+
+      - name: fuzz short mode (3 targets x 20s)
         run: |
           go test -run=FuzzAnalyze        -fuzz=FuzzAnalyze        -fuzztime=20s ./internal/analysis
           go test -run=FuzzCodecRoundtrip -fuzz=FuzzCodecRoundtrip -fuzztime=20s ./internal/codec
           go test -run=FuzzLexer          -fuzz=FuzzLexer          -fuzztime=20s ./internal/query
 
-      - name: demo 冒烟(语料→索引→搜索→why-not→check)
+      - name: HTTP smoke (index -> serve -> API -> UI -> method guard)
+        run: |
+          set -euo pipefail
+          BIN="$RUNNER_TEMP/lantern"
+          WORK="$RUNNER_TEMP/lantern-smoke"
+          go build -o "$BIN" ./cmd/lantern
+          mkdir -p "$WORK/docs"
+          printf '# Alpha\nrelease notes for the search engine\n' > "$WORK/docs/a.md"
+          (cd "$WORK" && "$BIN" index docs)
+          (cd "$WORK" && "$BIN" serve --addr 127.0.0.1:7711) &
+          PID=$!
+          trap 'kill $PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:7711/healthz >/dev/null 2>&1; then break; fi
+            sleep 0.25
+          done
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:7711/healthz)" = "200"
+          test "$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:7711/api/search?q=release')" = "200"
+          test "$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:7711/api/search?q=release&n=0')" = "400"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST 'http://127.0.0.1:7711/api/search?q=release')" = "405"
+          test "$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:7711/api/doc?path=../../etc/passwd')" = "404"
+          curl -fsS http://127.0.0.1:7711/ | grep -q 'Lantern'
+          curl -sI http://127.0.0.1:7711/ | grep -qi 'content-security-policy'
+          echo "HTTP smoke OK"
+
+      - name: demo smoke (corpus -> index -> search -> why-not -> check)
         run: bash scripts/demo.sh
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test (golden files must be OS-independent)
+        run: go test ./... -timeout 20m

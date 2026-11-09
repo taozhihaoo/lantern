@@ -51,6 +51,12 @@ func parseKnown(args []string, spec map[string]flagKind) (*parsedValues, []strin
 				if i+1 >= len(args) {
 					return nil, nil, true
 				}
+				// A value-taking flag must not swallow the following flag.
+				// e.g. `search q -n --json` used to set n="--json" and
+				// silently fall back to the default page size.
+				if next := args[i+1]; strings.HasPrefix(next, "-") && isFlagName(next, spec) {
+					return nil, nil, true
+				}
 				i++
 				val = args[i]
 			}
@@ -58,6 +64,34 @@ func parseKnown(args []string, spec map[string]flagKind) (*parsedValues, []strin
 		}
 	}
 	return pv, pos, false
+}
+
+// isFlagName reports whether s names a flag defined in spec. Used to keep
+// `-n --json` from being parsed as n="--json".
+func isFlagName(s string, spec map[string]flagKind) bool {
+	name := strings.TrimLeft(s, "-")
+	if eq := strings.IndexByte(name, '='); eq >= 0 {
+		name = name[:eq]
+	}
+	_, ok := spec[name]
+	return ok
+}
+
+// intInRange reads an integer flag with strict validation. An invalid or
+// out-of-range value is a usage error rather than a silent fallback.
+func (p *parsedValues) intInRange(name string, def, lo, hi int) (int, error) {
+	v, ok := p.last(name)
+	if !ok {
+		return def, nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil {
+		return 0, fmt.Errorf("--%s 需要整数,收到 %q", name, v)
+	}
+	if n < lo || n > hi {
+		return 0, fmt.Errorf("--%s 必须在 %d..%d 之间,收到 %d", name, lo, hi, n)
+	}
+	return n, nil
 }
 
 // parsedValues 提供带默认值的读取。
@@ -130,6 +164,7 @@ var (
 	watchFlags = map[string]flagKind{
 		"interval":      flagValue,
 		"workers":       flagValue,
+		"max-size":      flagValue,
 		"no-store-body": flagBool,
 	}
 	searchFlags = map[string]flagKind{

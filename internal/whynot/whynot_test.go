@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -138,9 +139,13 @@ func TestGolden(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read golden(先运行 go test -update 生成): %v", err)
 			}
-			if string(want) != text {
+			// Golden files are text; some Windows checkouts materialise them
+			// with CRLF while RenderText always emits \n. Normalise before the
+			// byte-for-byte comparison so the suite is OS-independent.
+			wantText := strings.ReplaceAll(string(want), "\r\n", "\n")
+			if wantText != text {
 				t.Fatalf("golden mismatch for %s:\n--- want ---\n%s\n--- got ---\n%s",
-					tc.name, want, text)
+					tc.name, wantText, text)
 			}
 			// JSON 输出必须合法。
 			j, err := rep.RenderJSON()

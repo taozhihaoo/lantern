@@ -102,13 +102,20 @@ func Run(o Options) ([]DocOut, []string, *Summary, error) {
 	sum := &Summary{Skipped: map[SkipReason]int{}}
 	start := time.Now()
 
-	// seen 记录本次扫描到的路径(删除检测用)。
+	// seen 记录本次扫描中"磁盘上确实存在"的所有路径(含被忽略/超限/
+	// 二进制等跳过的文件)。只有真正消失的路径才允许从索引删除,否则
+	// 一次临时读取失败就会把已有文档误删。
 	var mu sync.Mutex
 	seen := map[string]bool{}
 	var outs []DocOut
 
-	tasks := make(chan task, 256)
+	// okRoots 是本次成功打开的目标根。删除检测只在这些根之下进行:
+	// 目标目录被删除/改名/无权限/写错路径时,绝不能把其下文档当成
+	// "已删除"而清空索引。
+	var okRoots []string
 	var walkErr error
+
+	tasks := make(chan task, 256)
 	var walkWg sync.WaitGroup
 
 	// 遍历:单 goroutine(目录 IO 轻),解析并行。
@@ -135,8 +142,17 @@ func Run(o Options) ([]DocOut, []string, *Summary, error) {
 				mu.Unlock()
 				continue
 			}
+			mu.Lock()
+			okRoots = append(okRoots, rel)
+			mu.Unlock()
 			chain := NewIgnoreChain()
-			o.walkDir(chain, full, rel, o.Base, tasks, &seen, sum, &mu)
+			if err := o.walkDir(chain, full, rel, o.Base, tasks, &seen, sum, &mu); err != nil {
+				mu.Lock()
+				if walkErr == nil {
+					walkErr = err
+				}
+				mu.Unlock()
+			}
 		}
 	}()
 
@@ -168,13 +184,19 @@ func Run(o Options) ([]DocOut, []string, *Summary, error) {
 	// 按路径排序:结果与 worker 数无关。
 	sort.Slice(outs, func(i, j int) bool { return outs[i].Path < outs[j].Path })
 
-	// 删除检测:状态表中存在而本次未见的路径。
+	// 删除检测:状态表中存在、位于已成功扫描的根之下、且本次确未出现
+	// 的路径。目标根全部不可读时直接报错,避免误删整个索引。
 	var deletes []string
 	if o.StateList != nil {
-		for _, p := range o.StateList() {
-			if !seen[p] {
-				deletes = append(deletes, p)
+		statePaths := o.StateList()
+		if len(statePaths) > 0 && len(okRoots) == 0 {
+			return nil, nil, sum, fmt.Errorf("scan: 没有任何目标目录可读,拒绝执行删除检测")
+		}
+		for _, p := range statePaths {
+			if !underRoots(p, okRoots) || seen[p] {
+				continue
 			}
+			deletes = append(deletes, p)
 		}
 		sort.Strings(deletes)
 	}
@@ -206,9 +228,23 @@ func Run(o Options) ([]DocOut, []string, *Summary, error) {
 	return final, deletes, sum, nil
 }
 
+// underRoots 判断 p 是否位于某个已成功扫描的目标根之下。
+func underRoots(p string, roots []string) bool {
+	for _, root := range roots {
+		if root == "." || root == "" {
+			return true
+		}
+		if p == root || strings.HasPrefix(p, root+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // walkDir 递归遍历目录(不跟随符号链接),发送文件任务。
+// 返回非 nil 错误表示有目录无法读取,本次扫描不能安全地做删除检测。
 func (o *Options) walkDir(chain *IgnoreChain, full, rel, base string,
-	tasks chan<- task, seen *map[string]bool, sum *Summary, mu *sync.Mutex) {
+	tasks chan<- task, seen *map[string]bool, sum *Summary, mu *sync.Mutex) error {
 	// 解析本目录的忽略规则文件。
 	var rules []Rule
 	for _, name := range []string{".lanternignore", ".gitignore"} {
@@ -218,14 +254,20 @@ func (o *Options) walkDir(chain *IgnoreChain, full, rel, base string,
 		}
 	}
 	chain.Push(rules)
+	defer chain.Pop()
+
+	markSeen := func(p string) {
+		mu.Lock()
+		(*seen)[p] = true
+		mu.Unlock()
+	}
 
 	ents, err := o.Fsys.ReadDir(full)
 	if err != nil {
 		mu.Lock()
 		sum.Skipped[SkipRead]++
 		mu.Unlock()
-		chain.Pop()
-		return
+		return fmt.Errorf("scan: 无法读取目录 %s: %w", full, err)
 	}
 	for _, e := range ents {
 		name := e.Name()
@@ -242,40 +284,44 @@ func (o *Options) walkDir(chain *IgnoreChain, full, rel, base string,
 			}
 		}
 		if e.Type()&fs.ModeSymlink != 0 {
+			markSeen(childRel)
 			mu.Lock()
 			sum.Skipped[SkipSymlink]++
 			mu.Unlock()
 			continue
 		}
 		if d := chain.Evaluate(childRel, isDir); d.Ignored {
+			markSeen(childRel)
 			mu.Lock()
 			sum.Skipped[SkipIgnored]++
 			mu.Unlock()
 			continue
 		}
 		if isDir {
-			o.walkDir(chain, childFull, childRel, base, tasks, seen, sum, mu)
+			if err := o.walkDir(chain, childFull, childRel, base, tasks, seen, sum, mu); err != nil {
+				return err
+			}
 			continue
 		}
 		info, err := e.Info()
 		if err != nil {
+			markSeen(childRel)
 			mu.Lock()
 			sum.Skipped[SkipRead]++
 			mu.Unlock()
 			continue
 		}
 		if info.Size() > o.MaxSize {
+			markSeen(childRel)
 			mu.Lock()
 			sum.Skipped[SkipTooLarge]++
 			mu.Unlock()
 			continue
 		}
-		mu.Lock()
-		(*seen)[childRel] = true
-		mu.Unlock()
+		markSeen(childRel)
 		tasks <- task{full: childFull, rel: childRel, size: info.Size(), mtime: info.ModTime().Unix()}
 	}
-	chain.Pop()
+	return nil
 }
 
 // processFile 读取并提取单个文件( worker 内执行,不修改共享状态)。

@@ -10,7 +10,7 @@ import (
 	"lantern/internal/server"
 )
 
-// cmdServe:lantern serve [--addr 127.0.0.1:7700](规格 10)。
+// cmdServe: lantern serve [--addr 127.0.0.1:7700].
 func cmdServe(args []string) int {
 	args, idxDir := parseGlobal(args)
 	pv, _, uerr := parseKnown(args, serveFlags)
@@ -27,11 +27,13 @@ func cmdServe(args []string) int {
 	}
 	defer ix.Close()
 
-	srv := server.New(ix, base)
-	httpSrv := &http.Server{Addr: addr, Handler: srv.Handler()}
+	// HTTPServer applies read/write/idle timeouts; a slow client can no
+	// longer pin a goroutine indefinitely.
+	httpSrv := server.New(ix, base).HTTPServer(addr)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sig)
 	go func() {
 		<-sig
 		_ = httpSrv.Close()

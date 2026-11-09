@@ -1,0 +1,15 @@
+# Keep text files with LF endings in every checkout. The golden files in
+# internal/whynot/testdata are compared byte-for-byte with generated output
+# (which always uses \n); CRLF checkouts on Windows used to break that test.
+* text=auto eol=lf
+
+# Explicitly mark binary artifacts so they are never line-ending converted.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.exe binary
